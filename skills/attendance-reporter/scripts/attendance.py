@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import ctypes
 import getpass
 import hashlib
@@ -13,6 +15,7 @@ import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -1256,6 +1259,7 @@ class Credential(ctypes.Structure):
 class WindowsCredentialStore:
     CRED_TYPE_GENERIC = 1
     CRED_PERSIST_LOCAL_MACHINE = 2
+    ERROR_NOT_FOUND = 1168
 
     def __init__(self):
         if os.name != "nt":
@@ -1292,6 +1296,13 @@ class WindowsCredentialStore:
             f"{config.base_url}:{config.username}"
         )
 
+    @staticmethod
+    def session_target(config: AppConfig) -> str:
+        return (
+            "attendance-reporter-session:"
+            f"{config.base_url}:{config.username}"
+        )
+
     def _write(self, target: str, username: str, secret: str) -> None:
         blob = secret.encode("utf-16-le")
         buffer = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
@@ -1311,7 +1322,13 @@ class WindowsCredentialStore:
                 f"Windows Credential Manager write failed ({ctypes.get_last_error()})"
             )
 
-    def _read(self, target: str, missing_message: str) -> str:
+    def _read(
+        self,
+        target: str,
+        missing_message: str,
+        *,
+        optional: bool = False,
+    ) -> str | None:
         pointer = ctypes.POINTER(Credential)()
         ok = self.advapi.CredReadW(
             target,
@@ -1320,7 +1337,10 @@ class WindowsCredentialStore:
             ctypes.byref(pointer),
         )
         if not ok:
-            raise AuthenticationError(missing_message)
+            error = ctypes.get_last_error()
+            if optional and error == self.ERROR_NOT_FOUND:
+                return None
+            raise AuthenticationError(f"{missing_message} ({error})")
         try:
             credential = pointer.contents
             blob = ctypes.string_at(
@@ -1335,10 +1355,25 @@ class WindowsCredentialStore:
         self._write(self.target(config), config.username, password)
 
     def read(self, config: AppConfig) -> str:
-        return self._read(
+        password = self._read(
             self.target(config),
             "stored Hilanet credential was not found; run setup",
         )
+        if password is None:
+            raise AuthenticationError(
+                "stored Hilanet credential was not found; run setup"
+            )
+        return password
+
+    def read_session(self, config: AppConfig) -> str | None:
+        return self._read(
+            self.session_target(config),
+            "stored Hilanet session could not be read",
+            optional=True,
+        )
+
+    def write_session(self, config: AppConfig, payload: str) -> None:
+        self._write(self.session_target(config), config.username, payload)
 
     def preview_key(self, config: AppConfig) -> bytes:
         target = self.preview_key_target(config)
@@ -1358,14 +1393,20 @@ class WindowsCredentialStore:
     def delete_preview_key(self, config: AppConfig) -> None:
         self._delete(self.preview_key_target(config))
 
-    def _delete(self, target: str) -> None:
+    def delete_session(self, config: AppConfig) -> None:
+        self._delete(self.session_target(config), optional=True)
+
+    def _delete(self, target: str, *, optional: bool = False) -> None:
         if not self.advapi.CredDeleteW(
             target,
             self.CRED_TYPE_GENERIC,
             0,
         ):
+            error = ctypes.get_last_error()
+            if optional and error == self.ERROR_NOT_FOUND:
+                return
             raise SafetyError(
-                f"Windows Credential Manager delete failed ({ctypes.get_last_error()})"
+                f"Windows Credential Manager delete failed ({error})"
             )
 
 
@@ -1391,9 +1432,16 @@ class HttpResponse:
 
 
 class HilanSession:
-    def __init__(self, config: AppConfig, password: str):
+    def __init__(
+        self,
+        config: AppConfig,
+        password: str,
+        *,
+        session_store=None,
+    ):
         self.config = config
         self.password = password
+        self.session_store = session_store
         jar = http.cookiejar.CookieJar()
         self.cookie_jar = jar
         self.opener = urllib.request.build_opener(
@@ -1402,6 +1450,105 @@ class HilanSession:
         )
         self.identity: dict | None = None
         self.last_selected_html = ""
+        self._cached_session_loaded = self._restore_session()
+
+    def _session_payload(self) -> str:
+        cookies = [
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+                "secure": cookie.secure,
+                "expires": cookie.expires,
+                "http_only": cookie.has_nonstandard_attr("HttpOnly"),
+            }
+            for cookie in self.cookie_jar
+            if not cookie.is_expired()
+        ]
+        raw = json.dumps(
+            cookies,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return base64.urlsafe_b64encode(zlib.compress(raw)).decode("ascii")
+
+    def _restore_session(self) -> bool:
+        if self.session_store is None:
+            return False
+        payload = self.session_store.read_session(self.config)
+        if not payload:
+            return False
+        try:
+            raw = zlib.decompress(
+                base64.urlsafe_b64decode(payload.encode("ascii"))
+            )
+            cookies = json.loads(raw)
+            if not isinstance(cookies, list):
+                raise ValueError
+            host = urllib.parse.urlsplit(self.config.base_url).hostname or ""
+            for item in cookies:
+                domain = str(item["domain"])
+                if not isinstance(item["name"], str) or not isinstance(
+                    item["value"],
+                    str,
+                ):
+                    raise ValueError
+                normalized = domain.lstrip(".").casefold()
+                if (
+                    host.casefold() != normalized
+                    and not host.casefold().endswith("." + normalized)
+                ):
+                    raise ValueError
+                expires = item.get("expires")
+                self.cookie_jar.set_cookie(
+                    http.cookiejar.Cookie(
+                        version=0,
+                        name=item["name"],
+                        value=item["value"],
+                        port=None,
+                        port_specified=False,
+                        domain=domain,
+                        domain_specified=True,
+                        domain_initial_dot=domain.startswith("."),
+                        path=str(item.get("path") or "/"),
+                        path_specified=True,
+                        secure=bool(item.get("secure")),
+                        expires=int(expires) if expires is not None else None,
+                        discard=expires is None,
+                        comment=None,
+                        comment_url=None,
+                        rest=(
+                            {"HttpOnly": None}
+                            if item.get("http_only") is True
+                            else {}
+                        ),
+                        rfc2109=False,
+                    )
+                )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            binascii.Error,
+            json.JSONDecodeError,
+            zlib.error,
+        ):
+            self.cookie_jar.clear()
+            self.session_store.delete_session(self.config)
+            return False
+        return bool(list(self.cookie_jar))
+
+    def _save_session(self) -> None:
+        if self.session_store is not None:
+            self.session_store.write_session(
+                self.config,
+                self._session_payload(),
+            )
+
+    @staticmethod
+    def _is_login_url(url: str) -> bool:
+        return urllib.parse.urlsplit(url).path == "/login"
 
     def _request(
         self,
@@ -1473,10 +1620,21 @@ class HilanSession:
         HilanProtocol.parse_login_response(login.body)
         bootstrap = self._request("POST", BOOTSTRAP_PATH, json_body={})
         self.identity = HilanProtocol.parse_bootstrap(bootstrap.body)
+        self._save_session()
 
     def ensure_authenticated(self) -> None:
-        if self.identity is None:
-            self.authenticate()
+        if self.identity is not None:
+            return
+        if self._cached_session_loaded:
+            bootstrap = self._request("POST", BOOTSTRAP_PATH, json_body={})
+            if not self._is_login_url(bootstrap.url):
+                self.identity = HilanProtocol.parse_bootstrap(bootstrap.body)
+                self._save_session()
+                return
+            self.cookie_jar.clear()
+            self.session_store.delete_session(self.config)
+            self._cached_session_loaded = False
+        self.authenticate()
 
     def _calendar_headers(self, *, async_post: bool = False) -> dict[str, str]:
         headers = {
@@ -2028,9 +2186,13 @@ class HilanSession:
 
 
 class HilanBackend:
-    def __init__(self, config: AppConfig, password: str):
+    def __init__(self, config: AppConfig, password: str, *, session_store=None):
         self.config = config
-        self.session = HilanSession(config, password)
+        self.session = HilanSession(
+            config,
+            password,
+            session_store=session_store,
+        )
         self._types: list[AttendanceType] | None = None
 
     def account_context(self) -> str:
@@ -2087,7 +2249,11 @@ def make_service() -> AttendanceService:
     config = load_config()
     credentials = WindowsCredentialStore()
     password = credentials.read(config)
-    backend = HilanBackend(config, password)
+    backend = HilanBackend(
+        config,
+        password,
+        session_store=credentials,
+    )
     signing_key = credentials.preview_key(config)
     return AttendanceService(
         backend,
@@ -2123,6 +2289,7 @@ def command_setup(args) -> dict:
         raise SafetyError("passwords did not match")
     config = AppConfig(tenant, username)
     credentials = WindowsCredentialStore()
+    credentials.delete_session(config)
     credentials.write(config, password)
     credentials.preview_key(config)
     save_config(config)
@@ -2131,8 +2298,13 @@ def command_setup(args) -> dict:
 
 def command_doctor(_args) -> dict:
     config = load_config()
-    password = WindowsCredentialStore().read(config)
-    backend = HilanBackend(config, password)
+    credentials = WindowsCredentialStore()
+    password = credentials.read(config)
+    backend = HilanBackend(
+        config,
+        password,
+        session_store=credentials,
+    )
     types = backend.session.attendance_types()
     return {
         "status": "ready",
@@ -2143,8 +2315,13 @@ def command_doctor(_args) -> dict:
 
 def command_types(_args) -> dict:
     config = load_config()
-    password = WindowsCredentialStore().read(config)
-    backend = HilanBackend(config, password)
+    credentials = WindowsCredentialStore()
+    password = credentials.read(config)
+    backend = HilanBackend(
+        config,
+        password,
+        session_store=credentials,
+    )
     return {
         "status": "ready",
         "tenant": config.tenant,
@@ -2156,8 +2333,13 @@ def command_types(_args) -> dict:
 
 def command_probe_types(args) -> dict:
     config = load_config()
-    password = WindowsCredentialStore().read(config)
-    session = HilanSession(config, password)
+    credentials = WindowsCredentialStore()
+    password = credentials.read(config)
+    session = HilanSession(
+        config,
+        password,
+        session_store=credentials,
+    )
     attendance_types = session.attendance_types()
     target_date = build_plan([args.date], "probe").dates[0]
     return {

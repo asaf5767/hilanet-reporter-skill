@@ -2,10 +2,16 @@
 
 ## Credentials
 
-The Hilanet password and preview-signing key are stored as separate entries in
-Windows Credential Manager. The configuration file contains only the tenant and
-username. Session cookies stay in process memory and are copied only into a
-fresh local Edge context for the confirmed operation and proof.
+The Hilanet password, preview-signing key, and authenticated session are stored
+as separate entries in Windows Credential Manager. The session entry is bound
+to the configured tenant and username and is validated against Hilan before
+each runner process uses it. Expired sessions are replaced only after Hilan
+explicitly redirects to login. The configuration file contains only the tenant
+and username.
+
+Session cookies are copied into a fresh local Edge context only for the
+confirmed operation and proof. They never enter project files, command-line
+arguments, previews, logs, or model output.
 
 Never paste credentials into chat, issue reports, logs, or command-line
 arguments. Change a credential immediately if it is exposed.

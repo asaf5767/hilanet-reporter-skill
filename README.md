@@ -174,7 +174,10 @@ tenant is proven end to end.
 - Handles tenant scheduled/default rows through Hilan's native controls.
 - Requires preview and approval before every write.
 - Verifies every attempted date with a fresh Hilanet browser read.
-- Stores credentials in Windows Credential Manager.
+- Stores credentials and reusable authenticated sessions in Windows Credential
+  Manager.
+- Revalidates a cached session for each command, avoiding repeated password
+  logins during `doctor` → `types` → `preview` → `execute`.
 - Reports committed, rejected, unknown, and not-attempted results per date.
 
 Types that require hours, attachments, certificates, or other fields may still
@@ -259,6 +262,8 @@ The skill refreshes the reporting vocabulary before every preview.
 
 - Preview files are HMAC-signed with an independent random key stored in
   Windows Credential Manager.
+- Authenticated cookies are stored separately in Windows Credential Manager,
+  bound to the tenant and username, and checked before reuse.
 - Each preview is bound to one Hilanet account, expires after 15 minutes, and
   is atomically single-use.
 - Existing user attendance, locked dates, holidays, errors, future dates, and
@@ -307,7 +312,8 @@ Run `setup` from the installed skill directory.
 ### `account is temporarily locked`
 
 Stop retrying. Wait several minutes, verify the password manually in Hilanet,
-then run `doctor` once.
+then run `doctor` once. Version 1.0.1 and later reuse the authenticated session
+across commands instead of performing a password login for every invocation.
 
 ### CAPTCHA is required
 

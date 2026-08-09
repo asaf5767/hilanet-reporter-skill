@@ -4,8 +4,11 @@ import sys
 import tempfile
 import unittest
 import uuid
+from http.cookiejar import Cookie
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(
@@ -13,14 +16,18 @@ sys.path.insert(
     str(ROOT / "skills" / "attendance-reporter" / "scripts"),
 )
 
+import attendance as attendance_module  # noqa: E402
 from attendance import (  # noqa: E402
     AttendanceService,
     AttendanceType,
     AppConfig,
     DaySnapshot,
     FakeClock,
+    HilanSession,
     HilanProtocol,
+    HttpResponse,
     PreviewStore,
+    ProtocolError,
     SafetyError,
     WindowsCredentialStore,
     WriteReceipt,
@@ -33,6 +40,115 @@ from attendance import (  # noqa: E402
 
 NOW = datetime(2026, 8, 7, 9, 0, tzinfo=timezone.utc)
 VACATION = AttendanceType(code="V77", name="Vacation", localized_name="חופשה")
+
+
+class MemorySessionStore:
+    def __init__(self):
+        self.payload = None
+        self.write_count = 0
+        self.delete_count = 0
+
+    def read_session(self, _config):
+        return self.payload
+
+    def write_session(self, _config, payload):
+        self.payload = payload
+        self.write_count += 1
+
+    def delete_session(self, _config):
+        self.payload = None
+        self.delete_count += 1
+
+
+class ScriptedHilanSession(HilanSession):
+    login_requests = 0
+    reject_next_cached_bootstrap = False
+    corrupt_next_cached_bootstrap = False
+    fail_next_cached_bootstrap = False
+    rotate_next_cached_bootstrap = False
+
+    def _request(self, method, path, **_kwargs):
+        if path == "/":
+            return HttpResponse(200, self.config.base_url, '{"OrgId":"27"}')
+        if path == "/HilanCenter/Public/api/LoginApi/LoginRequest":
+            type(self).login_requests += 1
+            self.cookie_jar.set_cookie(
+                Cookie(
+                    version=0,
+                    name="HilanAuth",
+                    value="valid-session",
+                    port=None,
+                    port_specified=False,
+                    domain=f".{self.config.tenant}.hilan.co.il",
+                    domain_specified=True,
+                    domain_initial_dot=True,
+                    path="/",
+                    path_specified=True,
+                    secure=True,
+                    expires=None,
+                    discard=True,
+                    comment=None,
+                    comment_url=None,
+                    rest={"HttpOnly": None},
+                    rfc2109=False,
+                )
+            )
+            return HttpResponse(
+                200,
+                self.config.base_url + path,
+                '{"IsFail":false,"IsShowCaptcha":false}',
+            )
+        if path == (
+            "/Hilannetv2/Services/Public/WS/"
+            "HEmployeeStripApiapi.asmx/GetData"
+        ):
+            if type(self).fail_next_cached_bootstrap:
+                type(self).fail_next_cached_bootstrap = False
+                raise ProtocolError("simulated transport failure")
+            if type(self).reject_next_cached_bootstrap:
+                type(self).reject_next_cached_bootstrap = False
+                return HttpResponse(
+                    200,
+                    self.config.base_url + "/login",
+                    "<html>login</html>",
+                )
+            if type(self).corrupt_next_cached_bootstrap:
+                type(self).corrupt_next_cached_bootstrap = False
+                return HttpResponse(
+                    200,
+                    self.config.base_url + path,
+                    "<html>unexpected response</html>",
+                )
+            authenticated = any(
+                cookie.name == "HilanAuth"
+                and cookie.value in {"valid-session", "rotated-session"}
+                for cookie in self.cookie_jar
+            )
+            if not authenticated:
+                return HttpResponse(
+                    200,
+                    self.config.base_url + "/login",
+                    "<html>login</html>",
+                )
+            if type(self).rotate_next_cached_bootstrap:
+                type(self).rotate_next_cached_bootstrap = False
+                for cookie in self.cookie_jar:
+                    if cookie.name == "HilanAuth":
+                        cookie.value = "rotated-session"
+            return HttpResponse(
+                200,
+                self.config.base_url + path,
+                json.dumps(
+                    {
+                        "PrincipalUser": {
+                            "EmployeeId": 1508,
+                            "UserId": "employee-long-id",
+                        },
+                        "OrganizationId": "27",
+                    }
+                ),
+            )
+        raise AssertionError(f"unexpected request: {method} {path}")
 
 
 class FakeBackend:
@@ -532,6 +648,202 @@ class AttendanceServiceTests(unittest.TestCase):
         self.assertEqual(result["days"][0]["status"], "outcome_unknown")
 
 
+class HilanSessionReuseTests(unittest.TestCase):
+    def setUp(self):
+        ScriptedHilanSession.login_requests = 0
+        ScriptedHilanSession.reject_next_cached_bootstrap = False
+        ScriptedHilanSession.corrupt_next_cached_bootstrap = False
+        ScriptedHilanSession.fail_next_cached_bootstrap = False
+        ScriptedHilanSession.rotate_next_cached_bootstrap = False
+
+    def test_fresh_processes_reuse_cached_session_and_login_once(self):
+        config = AppConfig("tenant", "employee")
+        store = MemorySessionStore()
+
+        first = ScriptedHilanSession(
+            config,
+            "password",
+            session_store=store,
+        )
+        first.ensure_authenticated()
+        second = ScriptedHilanSession(
+            config,
+            "password",
+            session_store=store,
+        )
+        second.ensure_authenticated()
+
+        self.assertEqual(ScriptedHilanSession.login_requests, 1)
+        self.assertEqual(first.identity, second.identity)
+        self.assertEqual(store.write_count, 2)
+        self.assertTrue(
+            next(
+                cookie
+                for cookie in second.cookie_jar
+                if cookie.name == "HilanAuth"
+            ).has_nonstandard_attr("HttpOnly")
+        )
+
+    def test_only_literal_login_path_triggers_password_login(self):
+        self.assertTrue(
+            ScriptedHilanSession._is_login_url(
+                "https://tenant.hilan.co.il/login"
+            )
+        )
+        self.assertFalse(
+            ScriptedHilanSession._is_login_url(
+                "https://tenant.hilan.co.il/login/"
+            )
+        )
+        self.assertFalse(
+            ScriptedHilanSession._is_login_url(
+                "https://tenant.hilan.co.il/LOGIN"
+            )
+        )
+
+    def test_explicit_login_redirect_replaces_stale_session_once(self):
+        config = AppConfig("tenant", "employee")
+        store = MemorySessionStore()
+        first = ScriptedHilanSession(
+            config,
+            "password",
+            session_store=store,
+        )
+        first.ensure_authenticated()
+        ScriptedHilanSession.reject_next_cached_bootstrap = True
+
+        second = ScriptedHilanSession(
+            config,
+            "password",
+            session_store=store,
+        )
+        second.ensure_authenticated()
+
+        self.assertEqual(ScriptedHilanSession.login_requests, 2)
+        self.assertEqual(first.identity, second.identity)
+
+    def test_unexpected_cached_bootstrap_does_not_attempt_login(self):
+        config = AppConfig("tenant", "employee")
+        store = MemorySessionStore()
+        first = ScriptedHilanSession(
+            config,
+            "password",
+            session_store=store,
+        )
+        first.ensure_authenticated()
+        ScriptedHilanSession.corrupt_next_cached_bootstrap = True
+
+        second = ScriptedHilanSession(
+            config,
+            "password",
+            session_store=store,
+        )
+        with self.assertRaisesRegex(ProtocolError, "invalid JSON"):
+            second.ensure_authenticated()
+
+        self.assertEqual(ScriptedHilanSession.login_requests, 1)
+
+    def test_transport_failure_does_not_attempt_login(self):
+        config = AppConfig("tenant", "employee")
+        store = MemorySessionStore()
+        first = ScriptedHilanSession(
+            config,
+            "password",
+            session_store=store,
+        )
+        first.ensure_authenticated()
+        ScriptedHilanSession.fail_next_cached_bootstrap = True
+
+        second = ScriptedHilanSession(
+            config,
+            "password",
+            session_store=store,
+        )
+        with self.assertRaisesRegex(ProtocolError, "transport failure"):
+            second.ensure_authenticated()
+
+        self.assertEqual(ScriptedHilanSession.login_requests, 1)
+
+    def test_rotated_cached_cookie_is_persisted_again(self):
+        config = AppConfig("tenant", "employee")
+        store = MemorySessionStore()
+        first = ScriptedHilanSession(
+            config,
+            "password",
+            session_store=store,
+        )
+        first.ensure_authenticated()
+        ScriptedHilanSession.rotate_next_cached_bootstrap = True
+
+        second = ScriptedHilanSession(
+            config,
+            "password",
+            session_store=store,
+        )
+        second.ensure_authenticated()
+        third = ScriptedHilanSession(
+            config,
+            "password",
+            session_store=store,
+        )
+        third.ensure_authenticated()
+
+        self.assertEqual(ScriptedHilanSession.login_requests, 1)
+        self.assertEqual(store.write_count, 3)
+
+    def test_foreign_tenant_cookie_is_discarded_before_login(self):
+        store = MemorySessionStore()
+        first = ScriptedHilanSession(
+            AppConfig("first-tenant", "employee"),
+            "password",
+            session_store=store,
+        )
+        first.ensure_authenticated()
+
+        second = ScriptedHilanSession(
+            AppConfig("second-tenant", "employee"),
+            "password",
+            session_store=store,
+        )
+        second.ensure_authenticated()
+
+        self.assertEqual(ScriptedHilanSession.login_requests, 2)
+        self.assertEqual(store.delete_count, 1)
+
+    def test_session_cache_key_is_bound_to_username(self):
+        first = AppConfig("tenant", "first-user")
+        second = AppConfig("tenant", "second-user")
+
+        self.assertNotEqual(
+            WindowsCredentialStore.session_target(first),
+            WindowsCredentialStore.session_target(second),
+        )
+
+    def test_setup_invalidates_cached_session(self):
+        credentials = mock.Mock()
+        credentials.preview_key.return_value = b"key"
+        args = SimpleNamespace(tenant="tenant", username="employee")
+
+        with (
+            mock.patch.object(
+                attendance_module,
+                "WindowsCredentialStore",
+                return_value=credentials,
+            ),
+            mock.patch.object(
+                attendance_module.getpass,
+                "getpass",
+                side_effect=["password", "password"],
+            ),
+            mock.patch.object(attendance_module, "save_config"),
+        ):
+            attendance_module.command_setup(args)
+
+        config = AppConfig("tenant", "employee")
+        credentials.delete_session.assert_called_once_with(config)
+        credentials.write.assert_called_once_with(config, "password")
+
+
 class HilanProtocolTests(unittest.TestCase):
     def test_server_text_removes_control_chars_and_caps_output(self):
         self.assertEqual(
@@ -985,6 +1297,22 @@ class WindowsCredentialStoreTests(unittest.TestCase):
         finally:
             store.delete(config)
             store.delete_preview_key(config)
+
+    def test_round_trips_session_separately_from_password(self):
+        config = AppConfig(
+            tenant=f"attendance-test-{uuid.uuid4().hex}",
+            username="test-user",
+        )
+        store = WindowsCredentialStore()
+        try:
+            self.assertIsNone(store.read_session(config))
+            store.write_session(config, "compressed-cookie-payload")
+            self.assertEqual(
+                store.read_session(config),
+                "compressed-cookie-payload",
+            )
+        finally:
+            store.delete_session(config)
 
 
 class SkillContractTests(unittest.TestCase):
